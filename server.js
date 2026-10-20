@@ -30,6 +30,32 @@ async function loadLib() {
   return Lib;
 }
 
+
+// TikTok's data shape differs between library versions: read every known field name
+function firstStr(...vals) {
+  for (const v of vals) if (typeof v === 'string' && v.trim() !== '') return v.trim();
+  return '';
+}
+function pickUser(d) {
+  const u = d.user || d.userInfo || d.userDetails || {};
+  const id = firstStr(u.uniqueId, u.displayId, u.username, u.unique_id, u.display_id, d.uniqueId, d.displayId, d.username);
+  const nick = firstStr(u.nickname, u.nickName, u.nick_name, d.nickname, id);
+  // last resort: a stable id made from the numeric user id or the nickname
+  const fallback = firstStr(u.userId && String(u.userId), u.id && String(u.id), d.userId && String(d.userId), nick);
+  return { id: (id || fallback).replace(/\s+/g, '_'), nick };
+}
+function pickText(d) {
+  return firstStr(d.comment, d.content, d.text, d.message, d.msg, d.common && d.common.describe);
+}
+const sampled = {};
+function sample(kind, d) {
+  if (sampled[kind]) return;
+  sampled[kind] = true;
+  try {
+    console.log(`[sample ${kind}]`, JSON.stringify(d, (k, v) => (typeof v === 'bigint' ? String(v) : v)).slice(0, 1500));
+  } catch (_) {}
+}
+
 const rooms = new Map(); // tiktok user -> room
 
 function cleanUser(u) {
@@ -37,7 +63,7 @@ function cleanUser(u) {
 }
 function shortErr(e) {
   const msg = (e && (e.message || e.toString())) || 'unknown';
-  if (/offline|not.*live|LIVE has ended/i.test(msg)) return 'offline';
+  if (/offline|not.*live|isn't online|not online|LIVE has ended/i.test(msg)) return 'offline';
   return msg.slice(0, 120);
 }
 function push(room, ev) {
@@ -64,37 +90,27 @@ async function startConn(user, room) {
   room.status = 'connecting';
 
   conn.on(CHAT, (d) => {
-    const u = d.user || {};
-    push(room, {
-      type: 'comment',
-      user: u.uniqueId || d.uniqueId || '',
-      nickname: u.nickname || d.nickname || '',
-      text: d.comment || '',
-    });
+    sample('chat', d);
+    const who = pickUser(d);
+    push(room, { type: 'comment', user: who.id, nickname: who.nick, text: pickText(d) });
   });
   conn.on(GIFT, (d) => {
-    const u = d.user || {};
-    const det = d.giftDetails || {};
+    sample('gift', d);
+    const det = d.giftDetails || d.gift || {};
     const giftType = d.giftType != null ? d.giftType : det.giftType;
     // streakable gifts (type 1) fire repeatedly; only count them when the streak ends
-    if (giftType === 1 && !d.repeatEnd) return;
+    if (giftType === 1 && !(d.repeatEnd === true || d.repeatEnd === 1)) return;
+    const who = pickUser(d);
     push(room, {
-      type: 'gift',
-      user: u.uniqueId || d.uniqueId || '',
-      nickname: u.nickname || d.nickname || '',
-      gift: d.giftName || det.giftName || 'Gift',
-      count: d.repeatCount || 1,
-      diamonds: d.diamondCount || det.diamondCount || 1,
+      type: 'gift', user: who.id, nickname: who.nick,
+      gift: d.giftName || det.giftName || det.name || 'Gift',
+      count: Number(d.repeatCount || d.comboCount || 1) || 1,
+      diamonds: Number(d.diamondCount || det.diamondCount || det.diamond_count || 1) || 1,
     });
   });
   conn.on(LIKE, (d) => {
-    const u = d.user || {};
-    push(room, {
-      type: 'like',
-      user: u.uniqueId || d.uniqueId || '',
-      nickname: u.nickname || d.nickname || '',
-      count: d.likeCount || 1,
-    });
+    const who = pickUser(d);
+    push(room, { type: 'like', user: who.id, nickname: who.nick, count: Number(d.likeCount || d.count || 1) || 1 });
   });
   conn.on(STREAM_END, () => { room.status = 'offline'; retry(user, room); });
   conn.on('disconnected', () => {
