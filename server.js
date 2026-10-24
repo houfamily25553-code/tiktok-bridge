@@ -26,7 +26,16 @@ const RACE_KEY_CMDS = new Set(['start', 'clear', 'test']);
 const SIGN_API_KEY = process.env.SIGN_API_KEY || ''; // optional (Euler Stream key) if TikTok blocks connections
 const MAX_EVENTS = 500;          // comments kept per channel
 const IDLE_MS = 3 * 60 * 1000;   // stop a channel nobody polled for 3 minutes
-const RETRY_MS = 20 * 1000;
+const RETRY_MS = 20 * 1000;          // reconnect after a LIVE that was running drops
+const OFFLINE_RETRY_MS = 60 * 1000;  // LIVE not started yet: check once a minute
+const RATE_WAIT_MS = 30 * 60 * 1000; // TikTok signing limit hit: stop trying for 30 minutes
+// every connect attempt uses up the daily signing quota, so the bridge waits instead of hammering it
+let rateLimitedUntil = 0;
+function isRateLimit(msg) { return /rate.?limit|too many connections|429/i.test(String(msg || '')); }
+function waitText() {
+  const mins = Math.max(1, Math.ceil((rateLimitedUntil - Date.now()) / 60000));
+  return `rate limited: TikTok allows few connections per day. Waiting ${mins} min` + (SIGN_API_KEY ? '' : ' (add SIGN_API_KEY on Render to raise the limit)');
+}
 
 let Lib = null;
 async function loadLib() {
@@ -87,6 +96,10 @@ function push(room, ev) {
 
 async function startConn(user, room) {
   if (room.closed) return;
+  if (Date.now() < rateLimitedUntil) {
+    room.status = waitText();
+    return retry(user, room, rateLimitedUntil - Date.now() + 1000);
+  }
   let lib;
   try {
     lib = await loadLib();
@@ -125,32 +138,41 @@ async function startConn(user, room) {
     const who = pickUser(d);
     push(room, { type: 'like', user: who.id, nickname: who.nick, count: Number(d.likeCount || d.count || 1) || 1 });
   });
-  conn.on(STREAM_END, () => { room.status = 'offline'; retry(user, room); });
+  conn.on(STREAM_END, () => { room.status = 'offline'; retry(user, room, OFFLINE_RETRY_MS); });
   conn.on('disconnected', () => {
     if (room.status === 'connected') room.status = 'reconnecting';
-    retry(user, room);
+    retry(user, room, RETRY_MS);
   });
   conn.on('error', (e) => console.error(`[${user}]`, shortErr(e)));
 
   try {
     await conn.connect();
     room.status = 'connected';
+    room.fails = 0;
     console.log(`[${user}] connected`);
   } catch (e) {
     const err = shortErr(e);
+    room.fails = (room.fails || 0) + 1;
+    if (isRateLimit(err) || isRateLimit(e && e.message)) {
+      rateLimitedUntil = Date.now() + RATE_WAIT_MS;
+      room.status = waitText();
+      console.log(`[${user}] rate limited, pausing ${RATE_WAIT_MS / 60000} min`);
+      return retry(user, room, RATE_WAIT_MS);
+    }
     room.status = err === 'offline' ? 'offline' : 'error: ' + err;
     console.log(`[${user}] connect failed: ${err}`);
-    retry(user, room);
+    // offline: once a minute; other errors: 30 s, 1 min, 2 min ... up to 10 min
+    retry(user, room, err === 'offline' ? OFFLINE_RETRY_MS : Math.min(10 * 60 * 1000, 30 * 1000 * 2 ** (room.fails - 1)));
   }
 }
 
-function retry(user, room) {
+function retry(user, room, ms = RETRY_MS) {
   if (room.closed || room.retryTimer) return;
   room.retryTimer = setTimeout(() => {
     room.retryTimer = null;
     try { room.conn && room.conn.disconnect(); } catch (_) {}
     startConn(user, room);
-  }, RETRY_MS);
+  }, ms);
 }
 
 function stopRoom(user) {
@@ -280,10 +302,12 @@ async function handle(req, res) {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
   // ---- pages (no key needed to load them; the panel asks for the key)
-  if (p === '/' && (req.headers.accept || '').includes('text/html')) { res.writeHead(302, { Location: '/panel' }); return res.end(); }
+  if (p === '/' && (req.headers.accept || '').includes('text/html')) { res.writeHead(302, { Location: '/vmk-control' }); return res.end(); }
   if (p === '/') return send(res, 200, { ok: true, service: 'tiktok-roblox-bridge', channels: rooms.size, games: liveServers().length });
-  if (p === '/panel' || p === '/panel/') return sendPage(res, 'panel.html');
+  // two separate pages: full control (BRIDGE_KEY) and race only (RACE_KEY or BRIDGE_KEY)
+  if (p === '/vmk-control' || p === '/vmk-control.html' || p === '/panel' || p === '/panel/') return sendPage(res, 'vmk-control.html');
   if (p === '/overlay') return sendPage(res, 'overlay.html');
+  if (p === '/vmk-race' || p === '/vmk-race.html' || p === '/race' || p === '/race/') return sendPage(res, 'vmk-race.html');
 
   // ---- overlay data (read-only token)
   if (p === '/api/view') {
